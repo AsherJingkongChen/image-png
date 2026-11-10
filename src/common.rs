@@ -699,9 +699,21 @@ pub struct Info<'a> {
     pub compressed_latin1_text: Vec<ZTXtChunk>,
     /// iTXt field
     pub utf8_text: Vec<ITXtChunk>,
-    /// The chunks of the types passed to `Decoder::subscribe`, in the order of the file, each with
-    /// its raw data.
-    pub subscribed_chunks: Vec<(chunk::ChunkType, Vec<u8>)>,
+    /// The chunks of the types passed to `Decoder::subscribe`, in the order of the file.
+    pub subscribed_chunks: Vec<SubscribedChunk>,
+}
+
+/// A chunk of a type passed to `Decoder::subscribe`, as the file holds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubscribedChunk {
+    /// Its type.
+    pub type_: chunk::ChunkType,
+    /// Its data, without the length, type and CRC around it.
+    pub data: Vec<u8>,
+    /// Whether its CRC matched. One that did not is kept all the same, so that a damaged chunk is
+    /// not taken for a missing one, and its data may be damaged. When the decoder is set to ignore
+    /// CRCs, nothing is checked and this is `true`.
+    pub crc_ok: bool,
 }
 
 impl Default for Info<'_> {

@@ -3,7 +3,7 @@
 use std::io::Cursor;
 
 use png::chunk::ChunkType;
-use png::{BitDepth, ColorType, Decoder, DecodingError, Encoder, Limits};
+use png::{BitDepth, ColorType, Decoder, DecodingError, Encoder, Limits, SubscribedChunk};
 
 const PRVT: ChunkType = ChunkType(*b"prVt");
 
@@ -25,12 +25,19 @@ fn png_with(before: &[(ChunkType, &[u8])], after: &[(ChunkType, &[u8])]) -> Vec<
     bytes
 }
 
+/// The same PNG with one bit of the first chunk of this type's data flipped, CRC left as it was.
+fn damaged(mut png: Vec<u8>, type_: ChunkType) -> Vec<u8> {
+    let at = png.windows(4).position(|w| w == type_.0).unwrap() + 4;
+    png[at] ^= 1;
+    png
+}
+
 /// The subscribed chunks of a PNG, read to its end.
 fn read(
     png: &[u8],
     subscribe: &[ChunkType],
     limits: Limits,
-) -> Result<Vec<(ChunkType, Vec<u8>)>, DecodingError> {
+) -> Result<Vec<SubscribedChunk>, DecodingError> {
     let mut decoder = Decoder::new_with_limits(Cursor::new(png), limits);
     for type_ in subscribe {
         decoder.subscribe(*type_);
@@ -42,13 +49,21 @@ fn read(
     Ok(reader.info().subscribed_chunks.clone())
 }
 
+fn kept(data: &[u8], crc_ok: bool) -> SubscribedChunk {
+    SubscribedChunk {
+        type_: PRVT,
+        data: data.to_vec(),
+        crc_ok,
+    }
+}
+
 #[test]
 fn a_subscribed_chunk_is_kept_whole() {
     let data: Vec<u8> = (0..=255).cycle().take(100_000).collect();
     let png = png_with(&[(PRVT, &data)], &[]);
     assert_eq!(
         read(&png, &[PRVT], Limits::default()).unwrap(),
-        vec![(PRVT, data)]
+        vec![kept(&data, true)]
     );
 }
 
@@ -61,14 +76,9 @@ fn an_unsubscribed_chunk_is_skipped_as_before() {
 #[test]
 fn chunks_after_the_image_data_are_kept_too_in_file_order() {
     let png = png_with(&[(PRVT, b"one")], &[(PRVT, b"two"), (PRVT, b"")]);
-    let kept = read(&png, &[PRVT], Limits::default()).unwrap();
     assert_eq!(
-        kept,
-        vec![
-            (PRVT, b"one".to_vec()),
-            (PRVT, b"two".to_vec()),
-            (PRVT, vec![])
-        ]
+        read(&png, &[PRVT], Limits::default()).unwrap(),
+        vec![kept(b"one", true), kept(b"two", true), kept(b"", true)]
     );
 }
 
@@ -84,11 +94,24 @@ fn a_chunk_past_the_limits_is_an_error() {
 }
 
 #[test]
-fn a_chunk_with_a_bad_crc_is_not_kept() {
-    let mut png = png_with(&[(PRVT, b"tampered")], &[]);
-    let at = png.windows(4).position(|w| w == b"prVt").unwrap() + 4;
-    png[at] ^= 1;
-    assert_eq!(read(&png, &[PRVT], Limits::default()).unwrap(), vec![]);
+fn a_subscribed_chunk_with_a_bad_crc_is_kept_marked_and_the_image_still_decodes() {
+    let png = damaged(png_with(&[(PRVT, b"tampered")], &[(PRVT, b"fine")]), PRVT);
+    assert_eq!(
+        read(&png, &[PRVT], Limits::default()).unwrap(),
+        vec![kept(b"uampered", false), kept(b"fine", true)]
+    );
+    // nobody subscribed: skipped in silence, as before
+    assert_eq!(read(&png, &[], Limits::default()).unwrap(), vec![]);
+}
+
+#[test]
+fn a_bad_crc_is_an_error_when_ancillary_crc_failures_are_not_skipped() {
+    let png = damaged(png_with(&[(PRVT, b"tampered")], &[]), PRVT);
+    let mut options = png::DecodeOptions::default();
+    options.set_skip_ancillary_crc_failures(false);
+    options.subscribe(PRVT);
+    let decoder = Decoder::new_with_options(Cursor::new(&png), options);
+    assert!(decoder.read_info().is_err());
 }
 
 #[test]
@@ -99,6 +122,13 @@ fn a_type_the_crate_decodes_is_decoded_as_before() {
     let reader = decoder.read_info().unwrap();
     assert!(reader.info().subscribed_chunks.is_empty());
     assert_eq!(reader.info().uncompressed_latin1_text[0].text, "kiku");
+    // and when its CRC is bad, it is dropped as before, not kept as a subscribed chunk
+    let png = damaged(png, png::chunk::tEXt);
+    let mut decoder = Decoder::new(Cursor::new(&png));
+    decoder.subscribe(png::chunk::tEXt);
+    let reader = decoder.read_info().unwrap();
+    assert!(reader.info().subscribed_chunks.is_empty());
+    assert!(reader.info().uncompressed_latin1_text.is_empty());
 }
 
 #[test]

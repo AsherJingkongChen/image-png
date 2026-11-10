@@ -13,7 +13,7 @@ use crate::chunk::{self, ChunkType, IDAT, IEND, IHDR};
 use crate::common::{
     AnimationControl, BitDepth, BlendOp, ColorType, ContentLightLevelInfo, DisposeOp, FrameControl,
     Info, MasteringDisplayColorVolume, ParameterError, ParameterErrorKind, PixelDimensions,
-    ScaledFloat, SourceChromaticities, Unit,
+    ScaledFloat, SourceChromaticities, SubscribedChunk, Unit,
 };
 use crate::text_metadata::{ITXtChunk, TEXtChunk, TextDecodingError, ZTXtChunk};
 use crate::traits::ReadBytesExt;
@@ -532,7 +532,11 @@ impl DecodeOptions {
     ///
     /// For an ancillary chunk this crate does not decode itself, which it would otherwise skip.
     /// A chunk type it decodes is decoded as before, and an unknown critical chunk is still an
-    /// error. Each chunk is read whole within the [`Limits`], and one with a bad CRC is not kept.
+    /// error. Each chunk is read whole within the [`Limits`]. One whose CRC does not match is kept
+    /// all the same, marked by [`SubscribedChunk::crc_ok`], so that a damaged chunk is not taken
+    /// for a missing one; what it is worth is the caller's to judge. (With
+    /// [`DecodeOptions::set_skip_ancillary_crc_failures`] off, it is an error, as for any
+    /// ancillary chunk.)
     pub fn subscribe(&mut self, type_: ChunkType) {
         if !self.subscribed.contains(&type_) {
             self.subscribed.push(type_);
@@ -593,6 +597,8 @@ enum ChunkAction {
     Process,
     Skip,
     Reject,
+    /// Kept whole for the caller, who subscribed to its type.
+    Keep,
 }
 
 impl StreamingDecoder {
@@ -796,7 +802,7 @@ impl StreamingDecoder {
                         crc.update(buf);
                     }
 
-                    if *action == ChunkAction::Process {
+                    if matches!(action, ChunkAction::Process | ChunkAction::Keep) {
                         if raw_bytes.len() == raw_bytes.capacity() {
                             if self.limits.bytes == 0 {
                                 return Err(DecodingError::LimitsExceeded);
@@ -1001,11 +1007,20 @@ impl StreamingDecoder {
                             self.state = Some(State::new_u32(U32ValueKind::Length));
                             Ok((consumed_bytes, Decoded::BadAncillaryChunk(type_str)))
                         }
+                        ChunkAction::Keep => {
+                            self.keep_subscribed(type_str, true);
+                            self.state = Some(State::new_u32(U32ValueKind::Length));
+                            Ok((consumed_bytes, Decoded::ChunkComplete(type_str)))
+                        }
                     }
                 } else if self.decode_options.skip_ancillary_crc_failures
                     && !chunk::is_critical(type_str)
                 {
-                    // Ignore ancillary chunk with invalid CRC
+                    // Ignore ancillary chunk with invalid CRC. One the caller subscribed to is
+                    // kept all the same, marked, so that it is not taken for a missing chunk.
+                    if self.current_chunk.action == ChunkAction::Keep {
+                        self.keep_subscribed(type_str, false);
+                    }
                     self.state = Some(State::new_u32(U32ValueKind::Length));
                     Ok((consumed_bytes, Decoded::BadAncillaryChunk(type_str)))
                 } else {
@@ -1094,7 +1109,7 @@ impl StreamingDecoder {
                     self.limits.reserve_bytes(length - raw_bytes.capacity())?;
                     raw_bytes.reserve_exact(length);
                 }
-                self.current_chunk.action = ChunkAction::Process;
+                self.current_chunk.action = ChunkAction::Keep;
                 return Ok(State::ReadChunkData(type_str));
             }
             _ => {
@@ -1154,11 +1169,6 @@ impl StreamingDecoder {
             chunk::tEXt => self.parse_text(),
             chunk::zTXt => self.parse_ztxt(),
             chunk::iTXt => self.parse_itxt(),
-
-            // Chunks the caller subscribed to.
-            _ if self.decode_options.subscribed.contains(&type_str) => {
-                self.parse_subscribed(type_str)
-            }
 
             // Unrecognized chunks.
             _ => unreachable!(
@@ -1705,15 +1715,20 @@ impl StreamingDecoder {
         Ok(())
     }
 
-    fn parse_subscribed(&mut self, type_str: ChunkType) -> Result<(), DecodingError> {
-        // The bytes move into the info; the chunk buffer starts again at its first size.
-        let raw_bytes = std::mem::replace(
+    /// A subscribed chunk, read whole: into the info as it is, with whether its CRC matched.
+    fn keep_subscribed(&mut self, type_: ChunkType, crc_ok: bool) {
+        // The bytes move into the info, where the limits already count them, rather than being
+        // copied; the chunk buffer starts again at its first size.
+        let data = std::mem::replace(
             &mut self.current_chunk.raw_bytes,
             Vec::with_capacity(CHUNK_BUFFER_SIZE),
         );
         let info = self.info.as_mut().unwrap();
-        info.subscribed_chunks.push((type_str, raw_bytes));
-        Ok(())
+        info.subscribed_chunks.push(SubscribedChunk {
+            type_,
+            data,
+            crc_ok,
+        });
     }
 
     fn parse_exif(&mut self) -> Result<(), DecodingError> {
