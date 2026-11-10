@@ -281,6 +281,24 @@ impl<R: BufRead + Seek> Decoder<R> {
         self.read_decoder.set_ignore_iccp_chunk(ignore_iccp_chunk);
     }
 
+    /// Keep every chunk of this type, as its raw data, in [`Info::subscribed_chunks`]: for an
+    /// ancillary chunk this crate does not decode itself, which it would otherwise skip. See
+    /// [`DecodeOptions::subscribe`].
+    ///
+    /// eg.
+    /// ```
+    /// use std::fs::File;
+    /// use std::io::BufReader;
+    /// use png::{chunk::ChunkType, Decoder};
+    /// let mut decoder = Decoder::new(BufReader::new(File::open("tests/pngsuite/basi0g01.png").unwrap()));
+    /// decoder.subscribe(ChunkType(*b"prVt"));
+    /// let reader = decoder.read_info().unwrap();
+    /// assert!(reader.info().subscribed_chunks.is_empty());
+    /// ```
+    pub fn subscribe(&mut self, type_: crate::chunk::ChunkType) {
+        self.read_decoder.subscribe(type_);
+    }
+
     /// Set the decoder to ignore and not verify the Adler-32 checksum
     /// and CRC code.
     pub fn ignore_checksums(&mut self, ignore_checksums: bool) {

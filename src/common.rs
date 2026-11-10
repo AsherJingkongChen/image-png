@@ -699,6 +699,9 @@ pub struct Info<'a> {
     pub compressed_latin1_text: Vec<ZTXtChunk>,
     /// iTXt field
     pub utf8_text: Vec<ITXtChunk>,
+    /// The chunks of the types passed to `Decoder::subscribe`, in the order of the file, each with
+    /// its raw data.
+    pub subscribed_chunks: Vec<(chunk::ChunkType, Vec<u8>)>,
 }
 
 impl Default for Info<'_> {
@@ -729,6 +732,7 @@ impl Default for Info<'_> {
             uncompressed_latin1_text: Vec::new(),
             compressed_latin1_text: Vec::new(),
             utf8_text: Vec::new(),
+            subscribed_chunks: Vec::new(),
         }
     }
 }

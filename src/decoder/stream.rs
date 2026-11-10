@@ -469,6 +469,7 @@ pub struct DecodeOptions {
     ignore_text_chunk: bool,
     ignore_iccp_chunk: bool,
     skip_ancillary_crc_failures: bool,
+    subscribed: Vec<ChunkType>,
 }
 
 impl Default for DecodeOptions {
@@ -479,6 +480,7 @@ impl Default for DecodeOptions {
             ignore_text_chunk: false,
             ignore_iccp_chunk: false,
             skip_ancillary_crc_failures: true,
+            subscribed: Vec::new(),
         }
     }
 }
@@ -524,6 +526,17 @@ impl DecodeOptions {
     /// Defaults to `true`
     pub fn set_skip_ancillary_crc_failures(&mut self, skip_ancillary_crc_failures: bool) {
         self.skip_ancillary_crc_failures = skip_ancillary_crc_failures;
+    }
+
+    /// Keep every chunk of this type, as its raw data, in [`Info::subscribed_chunks`].
+    ///
+    /// For an ancillary chunk this crate does not decode itself, which it would otherwise skip.
+    /// A chunk type it decodes is decoded as before, and an unknown critical chunk is still an
+    /// error. Each chunk is read whole within the [`Limits`], and one with a bad CRC is not kept.
+    pub fn subscribe(&mut self, type_: ChunkType) {
+        if !self.subscribed.contains(&type_) {
+            self.subscribed.push(type_);
+        }
     }
 }
 
@@ -638,6 +651,11 @@ impl StreamingDecoder {
 
     pub fn set_ignore_iccp_chunk(&mut self, ignore_iccp_chunk: bool) {
         self.decode_options.set_ignore_iccp_chunk(ignore_iccp_chunk);
+    }
+
+    /// See [`DecodeOptions::subscribe`].
+    pub fn subscribe(&mut self, type_: ChunkType) {
+        self.decode_options.subscribe(type_);
     }
 
     /// Return whether the decoder is set to ignore the Adler-32 checksum.
@@ -1067,6 +1085,18 @@ impl StreamingDecoder {
                     FormatErrorInner::UnrecognizedCriticalChunk { type_str }.into(),
                 ));
             }
+            _ if self.decode_options.subscribed.contains(&type_str) => {
+                // The chunk is kept whole, and its length is known now: reserve it at once, within
+                // the limits, rather than doubling the buffer as it fills.
+                let raw_bytes = &mut self.current_chunk.raw_bytes;
+                let length = length as usize;
+                if raw_bytes.capacity() < length {
+                    self.limits.reserve_bytes(length - raw_bytes.capacity())?;
+                    raw_bytes.reserve_exact(length);
+                }
+                self.current_chunk.action = ChunkAction::Process;
+                return Ok(State::ReadChunkData(type_str));
+            }
             _ => {
                 self.current_chunk.action = ChunkAction::Skip;
                 return Ok(State::ReadChunkData(type_str));
@@ -1124,6 +1154,11 @@ impl StreamingDecoder {
             chunk::tEXt => self.parse_text(),
             chunk::zTXt => self.parse_ztxt(),
             chunk::iTXt => self.parse_itxt(),
+
+            // Chunks the caller subscribed to.
+            _ if self.decode_options.subscribed.contains(&type_str) => {
+                self.parse_subscribed(type_str)
+            }
 
             // Unrecognized chunks.
             _ => unreachable!(
@@ -1667,6 +1702,17 @@ impl StreamingDecoder {
             max_frame_average_light_level,
         });
 
+        Ok(())
+    }
+
+    fn parse_subscribed(&mut self, type_str: ChunkType) -> Result<(), DecodingError> {
+        // The bytes move into the info; the chunk buffer starts again at its first size.
+        let raw_bytes = std::mem::replace(
+            &mut self.current_chunk.raw_bytes,
+            Vec::with_capacity(CHUNK_BUFFER_SIZE),
+        );
+        let info = self.info.as_mut().unwrap();
+        info.subscribed_chunks.push((type_str, raw_bytes));
         Ok(())
     }
 
