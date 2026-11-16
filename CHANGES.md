@@ -6,6 +6,10 @@
   image's offset relative to a larger page or screen. The parsed value is
   exposed as `Info::image_offset` and can be set on the encoder via
   `Encoder::set_image_offset`. ([#645])
+* `CapturedChunk::crc_ok`: a captured ancillary chunk whose CRC is wrong is
+  kept, marked `false`, instead of dropped in silence, so a caller can tell a
+  damaged chunk from a missing one. It is not parsed. With
+  `set_skip_ancillary_crc_failures(false)` it is an error, as before.
 
 ### Changes
 

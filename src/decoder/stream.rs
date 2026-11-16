@@ -1040,7 +1040,12 @@ impl StreamingDecoder {
                 } else if self.decode_options.skip_ancillary_crc_failures
                     && !chunk::is_critical(type_str)
                 {
-                    // Ignore ancillary chunk with invalid CRC
+                    // Ignore ancillary chunk with invalid CRC. A captured one is kept all the
+                    // same, marked, so the caller can tell a damaged chunk from a missing one;
+                    // what it is worth is theirs to judge. It is not parsed.
+                    if self.decode_options.is_captured(type_str) {
+                        self.parse_captured(type_str, false)?;
+                    }
                     self.state = Some(State::new_u32(U32ValueKind::Length));
                     Ok((consumed_bytes, Decoded::BadAncillaryChunk(type_str)))
                 } else {
@@ -1154,7 +1159,7 @@ impl StreamingDecoder {
     fn parse_chunk(&mut self, type_str: ChunkType) -> Result<Decoded, DecodingError> {
         let is_captured = self.decode_options.is_captured(type_str);
         if is_captured {
-            self.parse_captured(type_str)?;
+            self.parse_captured(type_str, true)?;
         }
 
         let mut parse_result = match type_str {
@@ -1851,7 +1856,7 @@ impl StreamingDecoder {
         Ok(())
     }
 
-    fn parse_captured(&mut self, type_str: ChunkType) -> Result<(), DecodingError> {
+    fn parse_captured(&mut self, type_str: ChunkType, crc_ok: bool) -> Result<(), DecodingError> {
         self.limits
             .reserve_bytes(self.current_chunk.raw_bytes.len())?;
         self.info
@@ -1861,6 +1866,7 @@ impl StreamingDecoder {
             .push(CapturedChunk {
                 name: type_str,
                 data: self.current_chunk.raw_bytes.clone(),
+                crc_ok,
             });
         Ok(())
     }
@@ -3757,6 +3763,43 @@ mod tests {
     }
 
     #[test]
+    fn test_captured_chunk_with_a_bad_crc_is_kept_marked() {
+        let width = 16;
+        let mut png = Vec::new();
+        write_png_sig(&mut png);
+        write_rgba8_ihdr_with_width(&mut png, width);
+        write_chunk(&mut png, b"uNK1", b"data1");
+        // the last byte of the chunk is its CRC
+        *png.last_mut().unwrap() ^= 1;
+        write_chunk(
+            &mut png,
+            b"IDAT",
+            &generate_rgba8_with_width_and_height(width, width),
+        );
+        write_iend(&mut png);
+
+        let mut options = DecodeOptions::default();
+        options.set_captured_chunks(&[ChunkType(*b"uNK1")]).unwrap();
+        let reader = Decoder::new_with_options(Cursor::new(png.clone()), options.clone())
+            .read_info()
+            .unwrap();
+        assert_eq!(
+            reader.info().captured_chunks,
+            vec![CapturedChunk {
+                name: ChunkType(*b"uNK1"),
+                data: b"data1".to_vec(),
+                crc_ok: false,
+            }]
+        );
+
+        // when ancillary CRC failures are not skipped, it is an error like any other
+        options.set_skip_ancillary_crc_failures(false);
+        assert!(Decoder::new_with_options(Cursor::new(png), options)
+            .read_info()
+            .is_err());
+    }
+
+    #[test]
     fn test_captured_chunks_unknown() {
         let width = 16;
         let mut png = Vec::new();
@@ -3783,11 +3826,13 @@ mod tests {
             vec![
                 CapturedChunk {
                     name: ChunkType(*b"uNK1"),
-                    data: b"data1".to_vec()
+                    data: b"data1".to_vec(),
+                    crc_ok: true,
                 },
                 CapturedChunk {
                     name: ChunkType(*b"uNK2"),
-                    data: b"data2".to_vec()
+                    data: b"data2".to_vec(),
+                    crc_ok: true,
                 }
             ]
         );
@@ -3820,6 +3865,7 @@ mod tests {
             vec![CapturedChunk {
                 name: ChunkType(*b"tEXt"),
                 data: text_data.to_vec(),
+                crc_ok: true,
             }]
         );
         // Assert that it was also parsed
