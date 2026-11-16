@@ -1490,7 +1490,9 @@ impl StreamingDecoder {
     }
 
     /// The next PNG four-byte unsigned integer of a `kind` chunk. One past 2^31-1 is a format
-    /// error, so an ancillary chunk that holds one is dropped as a bad chunk.
+    /// error (PNG-3 7.1: such an integer is from 0 to 2^31-1), so an ancillary chunk that holds
+    /// one is dropped as a bad chunk, which PNG-3 13.2 allows a decoder: an ancillary chunk with
+    /// a value out of range may be ignored.
     fn read_png_uint(buf: &mut &[u8], kind: ChunkType) -> Result<u32, DecodingError> {
         let value: u32 = buf.read_be()?;
         if (..=MAX_PNG_UINT).contains(&value) {
