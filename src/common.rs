@@ -680,6 +680,10 @@ pub struct ContentLightLevelInfo {
 pub struct CapturedChunk {
     pub name: ChunkType,
     pub data: Vec<u8>,
+    /// Whether the chunk's CRC matched. A captured ancillary chunk whose CRC is wrong is kept
+    /// with `false` while ancillary CRC failures are skipped, so a damaged chunk can be told from
+    /// a missing one; with `set_skip_ancillary_crc_failures(false)` it is an error instead.
+    pub crc_ok: bool,
 }
 
 /// PNG info struct
