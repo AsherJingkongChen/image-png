@@ -11,7 +11,7 @@ use crate::chunk::{self, ChunkType};
 use crate::common::{
     AnimationControl, BitDepth, BlendOp, BytesPerPixel, ColorType, Compression, DisposeOp,
     FrameControl, ImageOffset, Info, OffsetUnit, ParameterError, ParameterErrorKind,
-    PixelDimensions, ScaledFloat, Unit,
+    PixelDimensions, ScaledFloat, Unit, MAX_PNG_UINT,
 };
 use crate::filter::{filter, Filter};
 use crate::text_metadata::{
@@ -36,9 +36,18 @@ pub struct FormatError {
 }
 
 #[derive(Debug)]
-enum FormatErrorKind {
-    ZeroWidth,
-    ZeroHeight,
+pub(crate) enum FormatErrorKind {
+    /// An image or frame width that is not from 1 to 2^31-1.
+    InvalidWidth(u32),
+    /// An image or frame height that is not from 1 to 2^31-1.
+    InvalidHeight(u32),
+    /// A PNG four-byte unsigned integer past 2^31-1, in a chunk of this type.
+    PngUintTooLarge {
+        kind: ChunkType,
+        value: u32,
+    },
+    /// A sequence number moved on past `u32::MAX`.
+    SequenceNumberOverflow,
     InvalidColorCombination(BitDepth, ColorType),
     NoPalette,
     // TODO: wait, what?
@@ -46,7 +55,8 @@ enum FormatErrorKind {
     NotAnimated,
     OutOfBounds,
     EndReached,
-    ZeroFrames,
+    /// A number of frames that is not from 1 to 2^31-1.
+    InvalidFrames(u32),
     MissingFrames,
     MissingData(usize),
     Unrecoverable,
@@ -79,9 +89,19 @@ impl fmt::Display for FormatError {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> result::Result<(), fmt::Error> {
         use FormatErrorKind::*;
         match self.inner {
-            ZeroWidth => write!(fmt, "Zero width not allowed"),
-            ZeroHeight => write!(fmt, "Zero height not allowed"),
-            ZeroFrames => write!(fmt, "Zero frames not allowed"),
+            InvalidWidth(w) => write!(fmt, "Width {} is not from 1 to {}", w, MAX_PNG_UINT),
+            InvalidHeight(h) => write!(fmt, "Height {} is not from 1 to {}", h, MAX_PNG_UINT),
+            InvalidFrames(n) => write!(
+                fmt,
+                "Number of frames {} is not from 1 to {}",
+                n, MAX_PNG_UINT
+            ),
+            PngUintTooLarge { kind, value } => write!(
+                fmt,
+                "{:?} holds {}, past the largest PNG four-byte unsigned integer {}",
+                kind, value, MAX_PNG_UINT
+            ),
+            SequenceNumberOverflow => write!(fmt, "Sequence number moved on past u32::MAX"),
             InvalidColorCombination(depth, color) => write!(
                 fmt,
                 "Invalid combination of bit-depth '{:?}' and color-type '{:?}'",
@@ -138,6 +158,29 @@ impl From<FormatErrorKind> for FormatError {
     }
 }
 
+/// `value`, a PNG four-byte unsigned integer for a `kind` chunk: one past 2^31-1 is an error.
+pub(crate) fn png_uint(value: u32, kind: ChunkType) -> Result<u32> {
+    if (..=MAX_PNG_UINT).contains(&value) {
+        Ok(value)
+    } else {
+        Err(EncodingError::Format(
+            FormatErrorKind::PngUintTooLarge { kind, value }.into(),
+        ))
+    }
+}
+
+/// The frame counts of an `acTL`: at least one frame, and both counts PNG four-byte unsigned
+/// integers.
+fn check_animation_control(actl: &AnimationControl) -> Result<()> {
+    if !(1..=MAX_PNG_UINT).contains(&actl.num_frames) {
+        return Err(EncodingError::Format(
+            FormatErrorKind::InvalidFrames(actl.num_frames).into(),
+        ));
+    }
+    png_uint(actl.num_plays, chunk::acTL)?;
+    Ok(())
+}
+
 impl From<TextEncodingError> for EncodingError {
     fn from(tee: TextEncodingError) -> Self {
         EncodingError::Format(FormatError {
@@ -183,10 +226,8 @@ impl<'a, W: Write> Encoder<'a, W> {
             return Err(EncodingError::Format(FormatErrorKind::NotAnimated.into()));
         }
 
-        if let Some(actl) = info.animation_control {
-            if actl.num_frames == 0 {
-                return Err(EncodingError::Format(FormatErrorKind::ZeroFrames.into()));
-            }
+        if let Some(actl) = &info.animation_control {
+            check_animation_control(actl)?;
         }
 
         Ok(Encoder {
@@ -210,16 +251,14 @@ impl<'a, W: Write> Encoder<'a, W> {
     /// chunks, except for the first image that is still encoded as `IDAT`. You can control if the
     /// first frame should be treated as an animation frame with [`Encoder::set_sep_def_img()`].
     ///
-    /// This method returns an error if `num_frames` is 0.
+    /// This method returns an error if `num_frames` is not from 1 to 2^31-1, or `num_plays` is
+    /// past 2^31-1: both are PNG four-byte unsigned integers.
     pub fn set_animated(&mut self, num_frames: u32, num_plays: u32) -> Result<()> {
-        if num_frames == 0 {
-            return Err(EncodingError::Format(FormatErrorKind::ZeroFrames.into()));
-        }
-
         let actl = AnimationControl {
             num_frames,
             num_plays,
         };
+        check_animation_control(&actl)?;
 
         let fctl = FrameControl {
             sequence_number: 0,
@@ -560,7 +599,7 @@ fn write_fdat_chunk<W: Write>(
         .ok()
         .and_then(|length| length.checked_add(4))
         .ok_or(EncodingError::LimitsExceeded)?;
-    let sequence_number = sequence_number.to_be_bytes();
+    let sequence_number = png_uint(sequence_number, chunk::fdAT)?.to_be_bytes();
 
     let mut header = [0; 12];
     header[..4].copy_from_slice(&length.to_be_bytes());
@@ -590,12 +629,16 @@ impl<W: Write> Writer<W> {
     }
 
     fn init(mut self, info: &Info<'_>) -> Result<Self> {
-        if self.info.width == 0 {
-            return Err(EncodingError::Format(FormatErrorKind::ZeroWidth.into()));
+        if !(1..=MAX_PNG_UINT).contains(&self.info.width) {
+            return Err(EncodingError::Format(
+                FormatErrorKind::InvalidWidth(self.info.width).into(),
+            ));
         }
 
-        if self.info.height == 0 {
-            return Err(EncodingError::Format(FormatErrorKind::ZeroHeight.into()));
+        if !(1..=MAX_PNG_UINT).contains(&self.info.height) {
+            return Err(EncodingError::Format(
+                FormatErrorKind::InvalidHeight(self.info.height).into(),
+            ));
         }
 
         if self
@@ -642,8 +685,8 @@ impl<W: Write> Writer<W> {
         // Encode the pHYs chunk
         if let Some(pd) = info.pixel_dims {
             let mut phys_data = [0; 9];
-            phys_data[0..4].copy_from_slice(&pd.xppu.to_be_bytes());
-            phys_data[4..8].copy_from_slice(&pd.yppu.to_be_bytes());
+            phys_data[0..4].copy_from_slice(&png_uint(pd.xppu, chunk::pHYs)?.to_be_bytes());
+            phys_data[4..8].copy_from_slice(&png_uint(pd.yppu, chunk::pHYs)?.to_be_bytes());
             match pd.unit {
                 Unit::Meter => phys_data[8] = 1,
                 Unit::Unspecified => phys_data[8] = 0,
@@ -847,8 +890,10 @@ impl<W: Write> Writer<W> {
                 self.write_zlib_encoded_idat(&zlib_encoded)?;
             }
             Some(ref mut fctl) => {
+                // `encode` and `write_fdat_chunk` refuse a sequence number past 2^31-1, so the
+                // one after it is at most 2^31 and adding 1 never overflows
                 fctl.encode(&mut self.w)?;
-                fctl.sequence_number = fctl.sequence_number.wrapping_add(1);
+                fctl.sequence_number += 1;
                 self.animation_written += 1;
 
                 // If the default image is the first frame of an animation, it's still an IDAT.
@@ -857,7 +902,7 @@ impl<W: Write> Writer<W> {
                 } else {
                     for chunk in zlib_encoded.chunks(Self::MAX_fdAT_CHUNK_LEN as usize) {
                         write_fdat_chunk(&mut self.w, fctl.sequence_number, chunk)?;
-                        fctl.sequence_number = fctl.sequence_number.wrapping_add(1);
+                        fctl.sequence_number += 1;
                     }
                 }
             }
@@ -1105,9 +1150,13 @@ impl<W: Write> Writer<W> {
             {
                 return Err(EncodingError::Format(FormatErrorKind::OutOfBounds.into()));
             } else if width == 0 {
-                return Err(EncodingError::Format(FormatErrorKind::ZeroWidth.into()));
+                return Err(EncodingError::Format(
+                    FormatErrorKind::InvalidWidth(width).into(),
+                ));
             } else if height == 0 {
-                return Err(EncodingError::Format(FormatErrorKind::ZeroHeight.into()));
+                return Err(EncodingError::Format(
+                    FormatErrorKind::InvalidHeight(height).into(),
+                ));
             }
             fctl.width = width;
             fctl.height = height;
@@ -1395,8 +1444,9 @@ impl<'a, W: Write> ChunkWriter<'a, W> {
         match wrt.info.frame_control {
             Some(_) if wrt.should_skip_frame_control_on_default_image() => {}
             Some(ref mut fctl) => {
+                // `encode` refuses a sequence number past 2^31-1, so adding 1 never overflows
                 fctl.encode(&mut wrt.w)?;
-                fctl.sequence_number = fctl.sequence_number.wrapping_add(1);
+                fctl.sequence_number += 1;
                 wrt.animation_written += 1;
             }
             _ => {}
@@ -1446,8 +1496,10 @@ impl<'a, W: Write> Write for ChunkWriter<'a, W> {
         // index == 0 means a chunk has been flushed out
         if self.index == 0 && self.curr_chunk == chunk::fdAT {
             let fctl = self.writer.info.frame_control.as_mut().unwrap();
-            self.buffer[0..4].copy_from_slice(&fctl.sequence_number.to_be_bytes());
-            fctl.sequence_number = fctl.sequence_number.wrapping_add(1);
+            // a sequence number past 2^31-1 is refused, so adding 1 never overflows
+            let sequence_number = png_uint(fctl.sequence_number, chunk::fdAT)?;
+            self.buffer[0..4].copy_from_slice(&sequence_number.to_be_bytes());
+            fctl.sequence_number += 1;
             self.index = 4;
         }
 
@@ -1641,9 +1693,13 @@ impl<'a, W: Write> StreamWriter<'a, W> {
             {
                 return Err(EncodingError::Format(FormatErrorKind::OutOfBounds.into()));
             } else if width == 0 {
-                return Err(EncodingError::Format(FormatErrorKind::ZeroWidth.into()));
+                return Err(EncodingError::Format(
+                    FormatErrorKind::InvalidWidth(width).into(),
+                ));
             } else if height == 0 {
-                return Err(EncodingError::Format(FormatErrorKind::ZeroHeight.into()));
+                return Err(EncodingError::Format(
+                    FormatErrorKind::InvalidHeight(height).into(),
+                ));
             }
             fctl.width = width;
             fctl.height = height;
@@ -1957,7 +2013,7 @@ mod tests {
         for data_len in [0, 1, 4, 255, 4097] {
             let data: Vec<_> = (0..data_len).map(|i| i as u8).collect();
 
-            for sequence_number in [0, 1, u32::MAX] {
+            for sequence_number in [0, 1, MAX_PNG_UINT] {
                 let mut payload = Vec::with_capacity(data.len() + 4);
                 payload.extend_from_slice(&sequence_number.to_be_bytes());
                 payload.extend_from_slice(&data);
@@ -1970,7 +2026,57 @@ mod tests {
 
                 assert_eq!(actual, expected);
             }
+
+            // a sequence number is a PNG four-byte unsigned integer
+            for sequence_number in [MAX_PNG_UINT + 1, u32::MAX] {
+                assert!(write_fdat_chunk(Vec::new(), sequence_number, &data).is_err());
+            }
         }
+    }
+
+    #[test]
+    fn png_uints_past_2_pow_31_minus_1_are_refused() {
+        // IHDR: a width and a height from 1 to 2^31-1
+        for (w, h) in [(0, 1), (1, 0), (MAX_PNG_UINT + 1, 1), (1, MAX_PNG_UINT + 1)] {
+            assert!(
+                Encoder::new(Vec::new(), w, h).write_header().is_err(),
+                "{w}x{h}"
+            );
+        }
+        assert!(Encoder::new(Vec::new(), MAX_PNG_UINT, 1)
+            .write_header()
+            .is_ok());
+
+        // acTL: from 1 to 2^31-1 frames, and at most 2^31-1 plays
+        let mut enc = Encoder::new(Vec::new(), 1, 1);
+        assert!(enc.set_animated(0, 0).is_err());
+        assert!(enc.set_animated(MAX_PNG_UINT + 1, 0).is_err());
+        assert!(enc.set_animated(1, MAX_PNG_UINT + 1).is_err());
+        assert!(enc.set_animated(MAX_PNG_UINT, MAX_PNG_UINT).is_ok());
+
+        // pHYs
+        let mut enc = Encoder::new(Vec::new(), 1, 1);
+        enc.set_pixel_dims(Some(PixelDimensions {
+            xppu: MAX_PNG_UINT + 1,
+            yppu: 1,
+            unit: Unit::Meter,
+        }));
+        assert!(enc.write_header().is_err());
+
+        // a scaled float, by every constructor
+        for v in [f32::NAN, -1.0, f32::INFINITY, 1e9] {
+            assert!(ScaledFloat::new(v).is_err(), "{v}");
+        }
+        assert_eq!(ScaledFloat::new(1.0).unwrap().into_scaled(), 100_000);
+        assert!(ScaledFloat::from_scaled(MAX_PNG_UINT).is_ok());
+        assert!(ScaledFloat::from_scaled(MAX_PNG_UINT + 1).is_err());
+        assert!(crate::SourceChromaticities::new(
+            (0.3127, 0.329),
+            (0.64, 0.33),
+            (0.3, 0.6),
+            (f32::NAN, 0.06)
+        )
+        .is_err());
     }
 
     #[test]
@@ -2473,12 +2579,12 @@ mod tests {
         };
 
         roundtrip(None)?;
-        roundtrip(Some(ScaledFloat::new(0.35)))?;
-        roundtrip(Some(ScaledFloat::new(0.45)))?;
-        roundtrip(Some(ScaledFloat::new(0.55)))?;
-        roundtrip(Some(ScaledFloat::new(0.7)))?;
-        roundtrip(Some(ScaledFloat::new(1.0)))?;
-        roundtrip(Some(ScaledFloat::new(2.5)))?;
+        roundtrip(Some(ScaledFloat::new(0.35).unwrap()))?;
+        roundtrip(Some(ScaledFloat::new(0.45).unwrap()))?;
+        roundtrip(Some(ScaledFloat::new(0.55).unwrap()))?;
+        roundtrip(Some(ScaledFloat::new(0.7).unwrap()))?;
+        roundtrip(Some(ScaledFloat::new(1.0).unwrap()))?;
+        roundtrip(Some(ScaledFloat::new(2.5).unwrap()))?;
 
         Ok(())
     }

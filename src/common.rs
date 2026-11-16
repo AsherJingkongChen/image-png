@@ -6,6 +6,11 @@ use crate::{chunk, chunk::ChunkType, encoder};
 use io::Write;
 use std::{borrow::Cow, fmt, io};
 
+/// The largest PNG four-byte unsigned integer: "PNG four-byte unsigned integers are limited to the
+/// range 0 to 2^31-1" (section 7.1). Chunk lengths, image and frame sizes, frame counts, sequence
+/// numbers, pixel densities and scaled floats are all such integers.
+pub(crate) const MAX_PNG_UINT: u32 = u32::MAX >> 1;
+
 /// Describes how a pixel is encoded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -306,11 +311,16 @@ impl FrameControl {
         self.sequence_number = s;
     }
 
-    pub fn inc_seq_num(&mut self, i: u32) {
-        self.sequence_number += i;
+    /// Moves the sequence number on by `i`; one that would pass `u32::MAX` is an error.
+    pub fn inc_seq_num(&mut self, i: u32) -> encoder::Result<()> {
+        self.sequence_number = self.sequence_number.checked_add(i).ok_or_else(|| {
+            encoder::EncodingError::Format(encoder::FormatErrorKind::SequenceNumberOverflow.into())
+        })?;
+        Ok(())
     }
 
     pub fn encode<W: Write>(self, w: &mut W) -> encoder::Result<()> {
+        encoder::png_uint(self.sequence_number, chunk::fcTL)?;
         let mut data = [0u8; 26];
         data[..4].copy_from_slice(&self.sequence_number.to_be_bytes());
         data[4..8].copy_from_slice(&self.width.to_be_bytes());
@@ -451,42 +461,47 @@ impl DeflateCompression {
 
 /// An unsigned integer scaled version of a floating point value,
 /// equivalent to an integer quotient with [fixed denominator][ScaledFloat::SCALING]).
+///
+/// The integer is a PNG four-byte unsigned integer, from 0 to 2^31-1, and every constructor
+/// refuses one outside that range, so any `ScaledFloat` can be written as it is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScaledFloat(u32);
 
 impl ScaledFloat {
     pub const SCALING: f32 = 100_000.0;
 
-    /// Gets whether the value is within the clamped range of this type.
-    pub fn in_range(value: f32) -> bool {
-        value >= 0.0 && (value * Self::SCALING).floor() <= u32::MAX as f32
-    }
-
     /// Gets whether the value can be exactly converted in round-trip.
     #[allow(clippy::float_cmp)] // Stupid tool, the exact float compare is _the entire point_.
     pub fn exact(value: f32) -> bool {
-        let there = Self::forward(value);
-        let back = Self::reverse(there);
-        value == back
-    }
-
-    fn forward(value: f32) -> u32 {
-        (value.max(0.0) * Self::SCALING).floor() as u32
+        Self::new(value).is_ok_and(|s| s.into_value() == value)
     }
 
     fn reverse(encoded: u32) -> f32 {
         encoded as f32 / Self::SCALING
     }
 
-    /// Slightly inaccurate scaling and quantization.
-    /// Clamps the value into the representable range if it is negative or too large.
-    pub fn new(value: f32) -> Self {
-        Self(Self::forward(value))
+    /// Slightly inaccurate scaling and quantization: the value times [`ScaledFloat::SCALING`],
+    /// rounded down. A value that is NaN, negative, or scales past 2^31-1 is an error.
+    pub fn new(value: f32) -> Result<Self, ParameterError> {
+        let scaled = (value * Self::SCALING).floor();
+        // NaN and negative values fail here; a value past u32::MAX becomes u32::MAX below, which
+        // the range then refuses, so the cast never turns a bad value into a good one
+        if scaled.is_nan() || scaled < 0.0 {
+            return Err(ParameterErrorKind::ScaledFloatOutOfRange.into());
+        }
+        Self::from_scaled(scaled as u32)
     }
 
-    /// Fully accurate construction from a value scaled as per specification.
-    pub fn from_scaled(val: u32) -> Self {
-        Self(val)
+    /// Fully accurate construction from a value scaled as per specification. A value past 2^31-1
+    /// is an error.
+    pub const fn from_scaled(val: u32) -> Result<Self, ParameterError> {
+        if val <= MAX_PNG_UINT {
+            Ok(Self(val))
+        } else {
+            Err(ParameterError {
+                inner: ParameterErrorKind::ScaledFloatOutOfRange,
+            })
+        }
     }
 
     /// Get the accurate encoded value.
@@ -514,13 +529,19 @@ pub struct SourceChromaticities {
 }
 
 impl SourceChromaticities {
-    pub fn new(white: (f32, f32), red: (f32, f32), green: (f32, f32), blue: (f32, f32)) -> Self {
-        SourceChromaticities {
-            white: (ScaledFloat::new(white.0), ScaledFloat::new(white.1)),
-            red: (ScaledFloat::new(red.0), ScaledFloat::new(red.1)),
-            green: (ScaledFloat::new(green.0), ScaledFloat::new(green.1)),
-            blue: (ScaledFloat::new(blue.0), ScaledFloat::new(blue.1)),
-        }
+    /// Each value as [`ScaledFloat::new`] takes it; any one it refuses is an error.
+    pub fn new(
+        white: (f32, f32),
+        red: (f32, f32),
+        green: (f32, f32),
+        blue: (f32, f32),
+    ) -> Result<Self, ParameterError> {
+        Ok(SourceChromaticities {
+            white: (ScaledFloat::new(white.0)?, ScaledFloat::new(white.1)?),
+            red: (ScaledFloat::new(red.0)?, ScaledFloat::new(red.1)?),
+            green: (ScaledFloat::new(green.0)?, ScaledFloat::new(green.1)?),
+            blue: (ScaledFloat::new(blue.0)?, ScaledFloat::new(blue.1)?),
+        })
     }
 
     #[rustfmt::skip]
@@ -995,6 +1016,8 @@ pub(crate) enum ParameterErrorKind {
     PolledAfterFatalError,
     /// Critical chunks cannot be captured when decoding.
     CannotCaptureCriticalChunk,
+    /// A [`ScaledFloat`] is a PNG four-byte unsigned integer once scaled: from 0 to 2^31-1.
+    ScaledFloatOutOfRange,
 }
 
 impl From<ParameterErrorKind> for ParameterError {
@@ -1017,6 +1040,12 @@ impl fmt::Display for ParameterError {
             CannotCaptureCriticalChunk => {
                 write!(fmt, "Critical chunks cannot be captured")
             }
+            ScaledFloatOutOfRange => write!(
+                fmt,
+                "A scaled float must be from 0 to {} once scaled by {}",
+                MAX_PNG_UINT,
+                ScaledFloat::SCALING
+            ),
         }
     }
 }

@@ -7,8 +7,27 @@
   exposed as `Info::image_offset` and can be set on the encoder via
   `Encoder::set_image_offset`. ([#645])
 
+### Changes
+
+* `ScaledFloat::new` and `ScaledFloat::from_scaled` return
+  `Result<ScaledFloat, ParameterError>`, and `SourceChromaticities::new`
+  returns `Result<SourceChromaticities, ParameterError>`. A scaled float is a
+  PNG four-byte unsigned integer, so a value that is NaN, negative or scales
+  past 2^31-1 is an error; `new` used to clamp it, NaN to 0 included.
+  `ScaledFloat::in_range` is gone, and `from_scaled` is a `const fn`.
+* `FrameControl::inc_seq_num` returns `Result<(), EncodingError>` instead of
+  overflowing past `u32::MAX`.
+
 ### Fixes
 
+* Every PNG four-byte unsigned integer is held to its range of 0 to 2^31-1
+  (section 7.1 of the specification). The encoder refuses an image or frame
+  width or height that is not from 1 to 2^31-1, a frame count that is not
+  from 1 to 2^31-1, a play count, a `pHYs` density or a sequence number past
+  2^31-1; it used to write any `u32`, and to wrap the sequence number past
+  `u32::MAX`. The decoder refuses an `IHDR` width or height past 2^31-1 and
+  any chunk longer than 2^31-1 bytes, and drops a `pHYs`, `gAMA`, `cHRM`,
+  `mDCV` or `cLLI` chunk that holds a value past it, as a bad ancillary chunk.
 * Reject `Encoder::with_info` calls whose `info.interlaced` is `true` with
   a clear `InterlacedEncodingUnsupported` format error. Previously the IHDR
   was written with `interlace_method = 1` but `write_image_data` wrote

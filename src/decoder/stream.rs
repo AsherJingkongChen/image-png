@@ -14,6 +14,7 @@ use crate::common::{
     AnimationControl, BitDepth, BlendOp, CapturedChunk, ColorType, ContentLightLevelInfo,
     DisposeOp, FrameControl, ImageOffset, Info, MasteringDisplayColorVolume, OffsetUnit,
     ParameterError, ParameterErrorKind, PixelDimensions, ScaledFloat, SourceChromaticities, Unit,
+    MAX_PNG_UINT,
 };
 use crate::text_metadata::{decode_iso_8859_1, ITXtChunk, TEXtChunk, TextDecodingError, ZTXtChunk};
 use crate::traits::ReadBytesExt;
@@ -233,8 +234,13 @@ pub(crate) enum FormatErrorInner {
         bit_depth: BitDepth,
     },
     ColorWithBadTrns(ColorType),
-    /// The image width or height is zero.
+    /// The image width or height is not from 1 to 2^31-1.
     InvalidDimensions,
+    /// A PNG four-byte unsigned integer past 2^31-1 (section 7.1), in a chunk of this type.
+    PngUintTooLarge {
+        kind: ChunkType,
+        value: u32,
+    },
     InvalidBitDepth(u8),
     InvalidColorType(u8),
     InvalidDisposeOp(u8),
@@ -351,6 +357,11 @@ impl fmt::Display for FormatError {
             ),
             PaletteRequired => write!(fmt, "Missing palette of indexed image."),
             InvalidDimensions => write!(fmt, "Invalid image dimensions"),
+            PngUintTooLarge { kind, value } => write!(
+                fmt,
+                "{:?} holds {}, past the largest PNG four-byte unsigned integer {}",
+                kind, value, MAX_PNG_UINT
+            ),
             InvalidColorBitDepth {
                 color_type,
                 bit_depth,
@@ -936,6 +947,18 @@ impl StreamingDecoder {
                     }
                 }
 
+                // "its value shall not exceed 2^31-1 bytes" (section 5.3): a longer chunk is no
+                // chunk, whatever its type
+                if !(..=MAX_PNG_UINT).contains(&length) {
+                    return Err(DecodingError::Format(
+                        FormatErrorInner::PngUintTooLarge {
+                            kind: type_str,
+                            value: length,
+                        }
+                        .into(),
+                    ));
+                }
+
                 self.current_chunk.type_ = type_str;
                 if !self.decode_options.ignore_crc {
                     self.current_chunk.crc.reset();
@@ -1461,6 +1484,27 @@ impl StreamingDecoder {
         }
     }
 
+    /// The next PNG four-byte unsigned integer of a `kind` chunk. One past 2^31-1 is a format
+    /// error, so an ancillary chunk that holds one is dropped as a bad chunk.
+    fn read_png_uint(buf: &mut &[u8], kind: ChunkType) -> Result<u32, DecodingError> {
+        let value: u32 = buf.read_be()?;
+        if (..=MAX_PNG_UINT).contains(&value) {
+            Ok(value)
+        } else {
+            Err(DecodingError::Format(
+                FormatErrorInner::PngUintTooLarge { kind, value }.into(),
+            ))
+        }
+    }
+
+    /// The next scaled float of a `kind` chunk, refused as [`Self::read_png_uint`] refuses.
+    fn read_scaled_float(buf: &mut &[u8], kind: ChunkType) -> Result<ScaledFloat, DecodingError> {
+        let value: u32 = buf.read_be()?;
+        ScaledFloat::from_scaled(value).map_err(|_| {
+            DecodingError::Format(FormatErrorInner::PngUintTooLarge { kind, value }.into())
+        })
+    }
+
     fn parse_phys(&mut self) -> Result<(), DecodingError> {
         let info = self.info.as_mut().unwrap();
         if self.have_idat {
@@ -1473,8 +1517,8 @@ impl StreamingDecoder {
             ))
         } else {
             let mut buf = &self.current_chunk.raw_bytes[..];
-            let xppu = buf.read_be()?;
-            let yppu = buf.read_be()?;
+            let xppu = Self::read_png_uint(&mut buf, chunk::pHYs)?;
+            let yppu = Self::read_png_uint(&mut buf, chunk::pHYs)?;
             let unit = buf.read_be()?;
             let unit = match Unit::from_u8(unit) {
                 Some(unit) => unit,
@@ -1530,32 +1574,12 @@ impl StreamingDecoder {
             ))
         } else {
             let mut buf = &self.current_chunk.raw_bytes[..];
-            let white_x: u32 = buf.read_be()?;
-            let white_y: u32 = buf.read_be()?;
-            let red_x: u32 = buf.read_be()?;
-            let red_y: u32 = buf.read_be()?;
-            let green_x: u32 = buf.read_be()?;
-            let green_y: u32 = buf.read_be()?;
-            let blue_x: u32 = buf.read_be()?;
-            let blue_y: u32 = buf.read_be()?;
-
+            let mut next = || Self::read_scaled_float(&mut buf, chunk::cHRM);
             let source_chromaticities = SourceChromaticities {
-                white: (
-                    ScaledFloat::from_scaled(white_x),
-                    ScaledFloat::from_scaled(white_y),
-                ),
-                red: (
-                    ScaledFloat::from_scaled(red_x),
-                    ScaledFloat::from_scaled(red_y),
-                ),
-                green: (
-                    ScaledFloat::from_scaled(green_x),
-                    ScaledFloat::from_scaled(green_y),
-                ),
-                blue: (
-                    ScaledFloat::from_scaled(blue_x),
-                    ScaledFloat::from_scaled(blue_y),
-                ),
+                white: (next()?, next()?),
+                red: (next()?, next()?),
+                green: (next()?, next()?),
+                blue: (next()?, next()?),
             };
 
             info.chrm_chunk = Some(source_chromaticities);
@@ -1575,14 +1599,13 @@ impl StreamingDecoder {
             ))
         } else {
             let mut buf = &self.current_chunk.raw_bytes[..];
-            let source_gamma: u32 = buf.read_be()?;
-            if source_gamma == 0 {
+            let source_gamma = Self::read_scaled_float(&mut buf, chunk::gAMA)?;
+            if source_gamma.into_scaled() == 0 {
                 return Err(DecodingError::Format(
                     FormatErrorInner::BadGammaValue.into(),
                 ));
             }
 
-            let source_gamma = ScaledFloat::from_scaled(source_gamma);
             info.gama_chunk = Some(source_gamma);
             Ok(())
         }
@@ -1697,23 +1720,32 @@ impl StreamingDecoder {
         let blue_y: u16 = buf.read_be()?;
         let white_x: u16 = buf.read_be()?;
         let white_y: u16 = buf.read_be()?;
-        fn scale(chunk: u16) -> ScaledFloat {
+        fn scale(v: u16) -> Result<ScaledFloat, DecodingError> {
             // `ScaledFloat::SCALING` is hardcoded to 100_000, which works
             // well for the `cHRM` chunk where the spec says that "a value
             // of 0.3127 would be stored as the integer 31270".  In the
             // `mDCV` chunk the spec says that "0.708, 0.292)" is stored as
             // "{ 35400, 14600 }", using a scaling factor of 50_000, so we
             // multiply by 2 before converting.
-            ScaledFloat::from_scaled((chunk as u32) * 2)
+            let value = u32::from(v) * 2;
+            ScaledFloat::from_scaled(value).map_err(|_| {
+                DecodingError::Format(
+                    FormatErrorInner::PngUintTooLarge {
+                        kind: chunk::mDCV,
+                        value,
+                    }
+                    .into(),
+                )
+            })
         }
         let chromaticities = SourceChromaticities {
-            white: (scale(white_x), scale(white_y)),
-            red: (scale(red_x), scale(red_y)),
-            green: (scale(green_x), scale(green_y)),
-            blue: (scale(blue_x), scale(blue_y)),
+            white: (scale(white_x)?, scale(white_y)?),
+            red: (scale(red_x)?, scale(red_y)?),
+            green: (scale(green_x)?, scale(green_y)?),
+            blue: (scale(blue_x)?, scale(blue_y)?),
         };
-        let max_luminance: u32 = buf.read_be()?;
-        let min_luminance: u32 = buf.read_be()?;
+        let max_luminance = Self::read_png_uint(&mut buf, chunk::mDCV)?;
+        let min_luminance = Self::read_png_uint(&mut buf, chunk::mDCV)?;
         if !buf.is_empty() {
             return Err(DecodingError::IoError(
                 std::io::ErrorKind::InvalidData.into(),
@@ -1737,8 +1769,8 @@ impl StreamingDecoder {
         }
 
         let mut buf = &*self.current_chunk.raw_bytes;
-        let max_content_light_level: u32 = buf.read_be()?;
-        let max_frame_average_light_level: u32 = buf.read_be()?;
+        let max_content_light_level = Self::read_png_uint(&mut buf, chunk::cLLI)?;
+        let max_frame_average_light_level = Self::read_png_uint(&mut buf, chunk::cLLI)?;
         if !buf.is_empty() {
             return Err(DecodingError::IoError(
                 std::io::ErrorKind::InvalidData.into(),
@@ -1842,7 +1874,7 @@ impl StreamingDecoder {
         let mut buf = &self.current_chunk.raw_bytes[..];
         let width = buf.read_be()?;
         let height = buf.read_be()?;
-        if width == 0 || height == 0 {
+        if !(1..=MAX_PNG_UINT).contains(&width) || !(1..=MAX_PNG_UINT).contains(&height) {
             return Err(DecodingError::Format(
                 FormatErrorInner::InvalidDimensions.into(),
             ));
@@ -2123,6 +2155,46 @@ mod tests {
     use std::rc::Rc;
 
     #[test]
+    fn png_uints_past_2_pow_31_minus_1() {
+        let format_error = |png: Vec<u8>| match Decoder::new(Cursor::new(png)).read_info() {
+            Err(DecodingError::Format(e)) => e.to_string(),
+            Err(e) => panic!("not a format error: {e}"),
+            Ok(_) => panic!("decoded"),
+        };
+
+        // IHDR is critical: a width past 2^31-1 is an error
+        let mut png = Vec::new();
+        write_png_sig(&mut png);
+        write_ihdr(&mut png, 1 << 31, 1, 8, 6, 0);
+        assert!(format_error(png).contains("dimensions"));
+
+        // pHYs and gAMA are ancillary: one holding a value past 2^31-1 is dropped, and the image
+        // still decodes
+        let mut png = Vec::new();
+        write_png_sig(&mut png);
+        write_rgba8_ihdr_with_width(&mut png, 1);
+        let mut phys = Vec::new();
+        phys.write_u32::<byteorder::BigEndian>(1 << 31).unwrap();
+        phys.write_u32::<byteorder::BigEndian>(1).unwrap();
+        phys.write_u8(1).unwrap();
+        write_chunk(&mut png, b"pHYs", &phys);
+        write_chunk(&mut png, b"gAMA", &(1u32 << 31).to_be_bytes());
+        write_rgba8_idats(&mut png, 1, 1024);
+        write_iend(&mut png);
+        let reader = Decoder::new(Cursor::new(png)).read_info().unwrap();
+        assert!(reader.info().pixel_dims.is_none());
+        assert!(reader.info().gama_chunk.is_none());
+
+        // a chunk longer than 2^31-1 bytes is no chunk, whatever its type
+        let mut png = Vec::new();
+        write_png_sig(&mut png);
+        write_rgba8_ihdr_with_width(&mut png, 1);
+        png.write_u32::<byteorder::BigEndian>(1 << 31).unwrap();
+        png.write_all(b"tEXt").unwrap();
+        assert!(format_error(png).contains("2147483648"));
+    }
+
+    #[test]
     fn image_gamma() -> Result<(), ()> {
         fn trial(path: &str, expected: Option<ScaledFloat>) {
             let decoder = crate::Decoder::new(BufReader::new(File::open(path).unwrap()));
@@ -2142,24 +2214,78 @@ mod tests {
         trial("tests/pngsuite/f04n2c08.png", None);
         trial("tests/pngsuite/f99n0g04.png", None);
         trial("tests/pngsuite/tm3n3p02.png", None);
-        trial("tests/pngsuite/g03n0g16.png", Some(ScaledFloat::new(0.35)));
-        trial("tests/pngsuite/g03n2c08.png", Some(ScaledFloat::new(0.35)));
-        trial("tests/pngsuite/g03n3p04.png", Some(ScaledFloat::new(0.35)));
-        trial("tests/pngsuite/g04n0g16.png", Some(ScaledFloat::new(0.45)));
-        trial("tests/pngsuite/g04n2c08.png", Some(ScaledFloat::new(0.45)));
-        trial("tests/pngsuite/g04n3p04.png", Some(ScaledFloat::new(0.45)));
-        trial("tests/pngsuite/g05n0g16.png", Some(ScaledFloat::new(0.55)));
-        trial("tests/pngsuite/g05n2c08.png", Some(ScaledFloat::new(0.55)));
-        trial("tests/pngsuite/g05n3p04.png", Some(ScaledFloat::new(0.55)));
-        trial("tests/pngsuite/g07n0g16.png", Some(ScaledFloat::new(0.7)));
-        trial("tests/pngsuite/g07n2c08.png", Some(ScaledFloat::new(0.7)));
-        trial("tests/pngsuite/g07n3p04.png", Some(ScaledFloat::new(0.7)));
-        trial("tests/pngsuite/g10n0g16.png", Some(ScaledFloat::new(1.0)));
-        trial("tests/pngsuite/g10n2c08.png", Some(ScaledFloat::new(1.0)));
-        trial("tests/pngsuite/g10n3p04.png", Some(ScaledFloat::new(1.0)));
-        trial("tests/pngsuite/g25n0g16.png", Some(ScaledFloat::new(2.5)));
-        trial("tests/pngsuite/g25n2c08.png", Some(ScaledFloat::new(2.5)));
-        trial("tests/pngsuite/g25n3p04.png", Some(ScaledFloat::new(2.5)));
+        trial(
+            "tests/pngsuite/g03n0g16.png",
+            Some(ScaledFloat::new(0.35).unwrap()),
+        );
+        trial(
+            "tests/pngsuite/g03n2c08.png",
+            Some(ScaledFloat::new(0.35).unwrap()),
+        );
+        trial(
+            "tests/pngsuite/g03n3p04.png",
+            Some(ScaledFloat::new(0.35).unwrap()),
+        );
+        trial(
+            "tests/pngsuite/g04n0g16.png",
+            Some(ScaledFloat::new(0.45).unwrap()),
+        );
+        trial(
+            "tests/pngsuite/g04n2c08.png",
+            Some(ScaledFloat::new(0.45).unwrap()),
+        );
+        trial(
+            "tests/pngsuite/g04n3p04.png",
+            Some(ScaledFloat::new(0.45).unwrap()),
+        );
+        trial(
+            "tests/pngsuite/g05n0g16.png",
+            Some(ScaledFloat::new(0.55).unwrap()),
+        );
+        trial(
+            "tests/pngsuite/g05n2c08.png",
+            Some(ScaledFloat::new(0.55).unwrap()),
+        );
+        trial(
+            "tests/pngsuite/g05n3p04.png",
+            Some(ScaledFloat::new(0.55).unwrap()),
+        );
+        trial(
+            "tests/pngsuite/g07n0g16.png",
+            Some(ScaledFloat::new(0.7).unwrap()),
+        );
+        trial(
+            "tests/pngsuite/g07n2c08.png",
+            Some(ScaledFloat::new(0.7).unwrap()),
+        );
+        trial(
+            "tests/pngsuite/g07n3p04.png",
+            Some(ScaledFloat::new(0.7).unwrap()),
+        );
+        trial(
+            "tests/pngsuite/g10n0g16.png",
+            Some(ScaledFloat::new(1.0).unwrap()),
+        );
+        trial(
+            "tests/pngsuite/g10n2c08.png",
+            Some(ScaledFloat::new(1.0).unwrap()),
+        );
+        trial(
+            "tests/pngsuite/g10n3p04.png",
+            Some(ScaledFloat::new(1.0).unwrap()),
+        );
+        trial(
+            "tests/pngsuite/g25n0g16.png",
+            Some(ScaledFloat::new(2.5).unwrap()),
+        );
+        trial(
+            "tests/pngsuite/g25n2c08.png",
+            Some(ScaledFloat::new(2.5).unwrap()),
+        );
+        trial(
+            "tests/pngsuite/g25n3p04.png",
+            Some(ScaledFloat::new(2.5).unwrap()),
+        );
         Ok(())
     }
 
@@ -2173,21 +2299,27 @@ mod tests {
         }
         trial(
             "tests/pngsuite/ccwn2c08.png",
-            Some(SourceChromaticities::new(
-                (0.3127, 0.3290),
-                (0.64, 0.33),
-                (0.30, 0.60),
-                (0.15, 0.06),
-            )),
+            Some(
+                SourceChromaticities::new(
+                    (0.3127, 0.3290),
+                    (0.64, 0.33),
+                    (0.30, 0.60),
+                    (0.15, 0.06),
+                )
+                .unwrap(),
+            ),
         );
         trial(
             "tests/pngsuite/ccwn3p08.png",
-            Some(SourceChromaticities::new(
-                (0.3127, 0.3290),
-                (0.64, 0.33),
-                (0.30, 0.60),
-                (0.15, 0.06),
-            )),
+            Some(
+                SourceChromaticities::new(
+                    (0.3127, 0.3290),
+                    (0.64, 0.33),
+                    (0.30, 0.60),
+                    (0.15, 0.06),
+                )
+                .unwrap(),
+            ),
         );
         trial("tests/pngsuite/basi0g01.png", None);
         trial("tests/pngsuite/basi0g02.png", None);
